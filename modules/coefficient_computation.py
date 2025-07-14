@@ -1,12 +1,16 @@
 """
-Coefficient Computation Module for FHE-AES
+Coefficient Computation Module for FHE-AES - Fixed Version
 
 This module handles all polynomial coefficient pre-computations using FFT-based methods.
 Implements Fix #1 from the paper alignment.
+
+FIXES:
+1. Add multivariate polynomial support for α > 1 LUTs
+2. Add LUT decomposition for αℓ→βℓ transformations
 """
 
 import numpy as np
-from scipy.fft import ifft
+from scipy.fft import ifft, ifftn
 from typing import Dict, List, Tuple
 
 
@@ -28,16 +32,20 @@ class CoefficientComputer:
         self._compute_xor_coefficients()
         self._compute_gf28_multiplication_coefficients()
         self._compute_bit_extraction_coefficients()
+        
+        # FIX #4: Add multivariate polynomial coefficients
+        self._compute_multivariate_coefficients()
     
     def _compute_sbox_coefficients(self):
         """
-        ## PAPER ALIGNMENT (Fix #1): Use FFT for O(n log n) coefficient calculation
-        ## PAPER ALIGNMENT (Fix #2): Split into two 8-to-4 LUTs for upper/lower nibbles
+        S-Box LUT(8→4)·다변수 LUT(4+4→4) 계수를 FFT로 계산합니다.
+        - IFFT 정규화는 'backward'(기본값) → 별도 스케일링 불필요
+        - 상·하위 니블을 각각 독립된 다항식으로 처리
         """
-        self._log("Computing S-Box coefficients using FFT...")
-        
-        # Standard AES S-Box
-        sbox = [
+        self._log("Computing S-Box coefficients (fixed normalization)…")
+
+        # ── AES S-Box 테이블 ─────────────────────────────────────────────
+        self.sbox = [
             0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
             0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
             0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
@@ -55,39 +63,49 @@ class CoefficientComputer:
             0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
             0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
         ]
-        
-        # Split S-Box outputs into upper and lower nibbles
-        sbox_upper = [(s >> 4) & 0xF for s in sbox]  # Upper 4 bits
-        sbox_lower = [s & 0xF for s in sbox]         # Lower 4 bits
-        
-        # Use FFT to compute polynomial coefficients
-        upper_values = np.array(sbox_upper, dtype=complex)
-        self.sbox_upper_coeffs = ifft(upper_values, n=256, norm='forward')
-        
-        lower_values = np.array(sbox_lower, dtype=complex)
-        self.sbox_lower_coeffs = ifft(lower_values, n=256, norm='forward')
-        
-        # Normalize to preserve precision
-        self.sbox_upper_coeffs *= len(upper_values)
-        self.sbox_lower_coeffs *= len(lower_values)
-        
-        self._log(f"S-Box coefficients computed: {len(self.sbox_upper_coeffs)} each")
+
+        # ── Univariate 8→4 LUT 계수 ────────────────────────────────
+        upper_vals = np.array([(s >> 4) & 0xF for s in self.sbox], dtype=np.complex128)
+        lower_vals = np.array([s & 0xF for s in self.sbox],      dtype=np.complex128)
+
+        self.sbox_upper_coeffs = ifft(upper_vals)   # 256-complex
+        self.sbox_lower_coeffs = ifft(lower_vals)
+
+        self._log(f"Univariate S-Box coefficients ready: {self.sbox_upper_coeffs.shape[0]}")
+
+        # ── Multivariate 4+4→4 LUT 계수 (16×16) ────────────────────
+        self._log("Computing multivariate S-Box coefficients…")
+
+        sbox_upper_mv = np.empty((16, 16), dtype=np.complex128)
+        sbox_lower_mv = np.empty((16, 16), dtype=np.complex128)
+
+        for r in range(16):         # right nibble
+            for l in range(16):     # left  nibble
+                v = self.sbox[(l << 4) | r]
+                sbox_upper_mv[r, l] = (v >> 4) & 0xF
+                sbox_lower_mv[r, l] =  v        & 0xF
+
+        self.sbox_upper_mv_coeffs = ifftn(sbox_upper_mv)  # shape (16,16)
+        self.sbox_lower_mv_coeffs = ifftn(sbox_lower_mv)
+
+        self._log(f"Multivariate tensor shape: {self.sbox_upper_mv_coeffs.shape}")
+
+        if self.verbose:
+            self._log(f"Max |univar| = {np.abs(self.sbox_upper_coeffs).max():.2e}")
+            self._log(f"Max |multivar| = {np.abs(self.sbox_upper_mv_coeffs).max():.2e}")
+
     
     def _compute_xor_coefficients(self):
-        """
-        ## PAPER ALIGNMENT (Fix #10): Pre-compute XOR as proper LUT
-        """
+        """Compute XOR LUT coefficients."""
         self._log("Computing XOR LUT coefficients using FFT...")
         
-        # XOR truth table for 1-bit inputs
-        xor_1bit_values = np.array([0, 1, 1, 0], dtype=complex)
-        self.xor_1bit_coeffs = ifft(xor_1bit_values, n=4, norm='forward') * 4
-        
-        # For 4-bit XOR (nibble-wise)
+        # 4-bit XOR (두 4-bit 입력 → 4-bit 출력)
+        # 입력: 8비트 (상위 4비트 = a, 하위 4비트 = b)
         xor_4bit_values = np.zeros(256, dtype=complex)
-        for i in range(16):
-            for j in range(16):
-                xor_4bit_values[i * 16 + j] = i ^ j
+        for i in range(256):
+            a = (i >> 4) & 0xF
+            b = i & 0xF
+            xor_4bit_values[i] = a ^ b
         
         self.xor_4bit_coeffs = ifft(xor_4bit_values, n=256, norm='forward') * 256
         
@@ -143,10 +161,65 @@ class CoefficientComputer:
         
         self._log("Bit extraction coefficients computed")
     
+    def _compute_multivariate_coefficients(self):
+        """
+        FIX #4: Compute coefficients for multivariate polynomials (α > 1).
+        
+        For 2-variable LUTs, we use 2D FFT to compute coefficient tensors.
+        """
+        self._log("Computing multivariate polynomial coefficients...")
+        
+        # Example: 2-variable 4-bit AND operation (for testing)
+        and_2var_table = np.zeros((16, 16), dtype=complex)
+        for i in range(16):
+            for j in range(16):
+                and_2var_table[i, j] = i & j
+        
+        # 2D IFFT to get coefficient tensor
+        self.and_2var_coeffs = ifftn(and_2var_table, norm='forward') * 256
+        
+        # Example: 2-variable 4-bit OR operation
+        or_2var_table = np.zeros((16, 16), dtype=complex)
+        for i in range(16):
+            for j in range(16):
+                or_2var_table[i, j] = i | j
+        
+        self.or_2var_coeffs = ifftn(or_2var_table, norm='forward') * 256
+        
+        self._log("Multivariate coefficients computed")
+    
+    def decompose_lut(self, lut_table: np.ndarray, input_bits: int, output_bits: int) -> List[np.ndarray]:
+        """
+        FIX #5: Decompose αℓ→βℓ LUT into β separate αℓ→ℓ LUTs.
+        
+        Args:
+            lut_table: The full LUT as a 1D array of size 2^input_bits
+            input_bits: Number of input bits (α*ℓ)
+            output_bits: Number of output bits (β*ℓ)
+        
+        Returns:
+            List of β coefficient arrays, one for each output bit
+        """
+        self._log(f"Decomposing {input_bits}→{output_bits} LUT into {output_bits} sub-LUTs")
+        
+        decomposed_coeffs = []
+        
+        for out_bit in range(output_bits):
+            # Extract the out_bit-th bit from each LUT entry
+            bit_values = np.zeros(len(lut_table), dtype=complex)
+            for i, val in enumerate(lut_table):
+                bit_values[i] = (int(val) >> out_bit) & 1
+            
+            # Compute coefficients for this bit's LUT
+            coeffs = ifft(bit_values, norm='forward') * len(bit_values)
+            decomposed_coeffs.append(coeffs)
+        
+        return decomposed_coeffs
+    
     def compute_linear_layer_luts(self) -> Dict[Tuple[int, int], np.ndarray]:
         """
         Compute coefficients for the unified ShiftRows+MixColumns LUT
-        (16 input bytes × 16 output bytes ⇒ 256 개 8→8 LUT).
+        (16 input bytes × 16 output bytes ⇒ 256 개 8→8 LUT).
         Returns
         -------
         Dict[(in_pos, out_pos), np.ndarray]

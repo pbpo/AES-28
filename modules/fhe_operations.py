@@ -1,8 +1,12 @@
 """
-FHE Operations Module
+FHE Operations Module - Fixed Version
 
 This module handles core FHE operations including noise reduction, bootstrapping,
 and key generation with proper parameters from the paper.
+
+FIXES:
+1. Correct ζ = exp(2πi/16) encoding for 16th roots of unity
+2. Force bootstrapping after every LUT evaluation
 """
 
 import numpy as np
@@ -56,8 +60,12 @@ class FHEOperations:
         # Noise reduction parameters
         self.noise_reduction_degree = 16
         
-        # Complex encoding
-        self.zeta = np.exp(2j * np.pi / self.N)
+        # FIX #1: Use 16th roots of unity as specified in paper
+        self.zeta_16 = np.exp(2j * np.pi / 16)  # 16th root of unity
+        self.zeta = self.zeta_16  # Primary encoding uses 16th roots
+        
+        # For compatibility, keep N-th root for other operations
+        self.zeta_N = np.exp(2j * np.pi / self.N)
         
     def generate_keys(self) -> Dict[str, object]:
         """Generate and cache all FHE keys needed by the module."""
@@ -172,36 +180,45 @@ class FHEOperations:
         self._log(f" → new level {result.level}")
         return result
     
-    def bootstrap_if_needed(self, ct: "desilofhe.Ciphertext") -> "desilofhe.Ciphertext":
+    def bootstrap_if_needed(self, ct: "desilofhe.Ciphertext", force: bool = False) -> "desilofhe.Ciphertext":
         """
         Perform CKKS bootstrapping when level is critically low (≤3 by default).
-        Requires self.enable_bootstrapping = True and self.bootstrap_key set.
+        
+        FIX #2: Add force parameter to enable bootstrapping after every LUT
         """
         if not self.enable_bootstrapping or self.bootstrap_key is None:
             return ct
 
-        if ct.level > 3:                       # 아직 여유 있음
-            return ct
-
-        self._log(f"Bootstrapping (level {ct.level}) …")
-        try:
-            refreshed = self.engine.bootstrap(ct, self.bootstrap_key)
-            self._log(f"Bootstrap OK → level {refreshed.level}")
-            return refreshed
-        except Exception as e:
-            self._log(f"⚠️  bootstrap failed: {e} (continue unrefreshed)")
-            return ct
+        # Force bootstrapping if requested (paper requirement)
+        if force or ct.level <= 3:
+            self._log(f"Bootstrapping (level {ct.level}, forced={force}) …")
+            try:
+                refreshed = self.engine.bootstrap(ct, self.bootstrap_key)
+                self._log(f"Bootstrap OK → level {refreshed.level}")
+                return refreshed
+            except Exception as e:
+                self._log(f"⚠️  bootstrap failed: {e} (continue unrefreshed)")
+                return ct
+        
+        return ct
         
     def encode_to_roots_of_unity(self, value: int) -> complex:
-        """Encode integer value as root of unity: encode(x) = ζ^x"""
-        return self.zeta ** value
+        """
+        FIX #1: Encode integer value as 16th root of unity: encode(x) = ζ₁₆^x
+        
+        Paper specifies encoding nibbles (0-15) as 16th roots of unity.
+        """
+        return self.zeta_16 ** value
     
     def decode_from_roots_of_unity(self, encoded: complex) -> int:
-        """Decode from root of unity to nearest integer."""
+        """
+        FIX #1: Decode from 16th root of unity to nearest integer.
+        """
         angle = np.angle(encoded)
         if angle < 0:
             angle += 2 * np.pi
-        x = int(round(angle * self.N / (2 * np.pi))) % self.N
+        # Decode using 16 instead of N
+        x = int(round(angle * 16 / (2 * np.pi))) % 16
         return x
     
     def prepare_gapped_layout(self, batch_data: np.ndarray, slot_gap: int, 
@@ -224,6 +241,7 @@ class FHEOperations:
                 left_nibble = (byte_val >> 4) & 0xF
                 right_nibble = byte_val & 0xF
                 
+                # Use fixed 16th roots encoding
                 left_encoded = self.encode_to_roots_of_unity(left_nibble)
                 right_encoded = self.encode_to_roots_of_unity(right_nibble)
                 
